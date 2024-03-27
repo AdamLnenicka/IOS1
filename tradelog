@@ -1,0 +1,248 @@
+#!/bin/sh
+
+# tradelog(.sh) - IOS - Projekt 1
+# Adam Lněnička (xlneni00)
+# 03.04.2021
+# analyzátor logů z obchodování na burze
+
+export POSIXLY_CORRECT=yes
+export LC_ALL=C
+
+print_help() {
+    echo "Tradelog - analyzátor logů z obchodování na burze
+    použití:
+
+        ./tradelog.sh [-h|--help] [FILTER] [PŘÍKAZ] [LOG [LOG2 [...]]
+    
+    PŘÍKAZ může být jeden z:
+        list-tick   – výpis seznamu vyskytujících se burzovních symbolů, tzv. tickerů
+        
+        profit      – výpis celkového zisku z uzavřených pozic
+        
+        pos         – výpis hodnot aktuálně držených pozic seřazených sestupně podle hodnoty
+        
+        last-price  – výpis poslední známé ceny pro každý ticker
+        
+        hist-ord    – výpis histogramu počtu transakcí podle tickeru
+        
+        graph-pos   – výpis grafu hodnot držených pozic podle tickeru
+
+    FILTER může být kombinace následujících:
+        -a DATETIME – after: jsou uvážovány pouze záznamy PO tomto datu (bez tohoto data). DATETIME je ve formátu RRRR-MM-DD HH:MM:SS
+        
+        -b DATETIME – before: jsou uvážovány pouze záznamy PŘED tímto datem (bez tohoto data)
+        
+        -t TICKER   – jsou uvážovány pouze záznamy odpovídající danému tickeru
+                    – při více výskytech přepínače se bere množina všech uvedených tickerů
+        
+        -w WIDTH    – při výpisu grafů nastavuje jejich šířku, tedy délku nejdelšího řádku na WIDTH
+
+    -h [--help]     – vypíše nápovědu s krátkým popisem každého příkazu a přepínače
+    "
+
+    return 0
+}
+
+# načtení vstupu a odfiltrování položek
+read_input() {
+    if [ -z "$LOGS" ] && [ -z "$GZIP_LOGS" ]; then
+        cat | awk -F ";" -v ticks="^$TICKERS$" -v aft="$AFTER" -v bef="$BEFORE" '
+            $2 ~ ticks { if ($1>aft && $1 <bef) print }'
+    else
+        gzip -q -d -c $GZIP_LOGS 2>/dev/null | cat $LOGS - | awk -F ";" -v ticks="^$TICKERS$" -v aft="$AFTER" -v bef="$BEFORE" '
+            $2 ~ ticks { if ($1>aft && $1<bef) print }'
+    fi
+   
+    return 0
+}
+
+# výpis tickerů, které se vyskytují v záznamech
+list_tick() {
+    echo "$INPUT" | awk -F ";" '{ print $2 }' | sort | uniq
+    return 0
+}
+
+# výpis celkového zisku z uzavřených pozic
+profit() {
+    echo "$INPUT" | awk -F ";" '$3=="sell" { sum+=$4 * $6 } $3=="buy" { sum-=$4 * $6 } END {printf "%.2f\n", sum}'
+    return 0
+}
+
+# výpis hodnot aktuálně držených pozic pro každý ticker
+pos() {
+    for i in $(list_tick); do
+        echo "$INPUT" | awk -F ";" -v t="$i" '$2==t { if ($3=="sell") {sell+=$6; l=$4} else {buy+=$6; l=$4} } END {printf "%s:%.2f\n", t, (buy-sell)*l}'
+    done
+    return 0
+}
+
+# výpis poslední známé ceny pro každý ticker
+last_price() {
+    for i in $(list_tick); do
+        echo "$INPUT" | awk -F ";" -v t="$i" '$2==t {last_p=$4} END {printf "%-9s : %7.2f\n", t, last_p}'
+    done
+    return 0
+}
+
+# výpis počtu transakcí pro každý z tickerů
+transact_counts() {
+    for i in $(list_tick); do
+        echo "$INPUT" | awk -F ";" -v t="$i" '$2==t { counter++ } END {printf "%s:%.2f\n", t, counter}'
+    done
+}
+
+# výpis histogramu počtu transakcí podle tickeru
+hist_ord() {
+    COUNTS=$(transact_counts)
+    if [ $WIDTH -eq 0 ]; then
+        echo "$COUNTS" | awk -F ":" '{ if ($2 > 0) { printf "%-9s : ", $1; for(c=0;c<$2;c++) printf "#"; printf "\n"} }'
+    else
+        MAX=$(echo "$COUNTS" | sort -t: -k2 -n -r | head -n1 | awk -F ":" '{print $2}')
+        float_scale=10
+        RATIO=$(echo "scale=$float_scale; $MAX/$WIDTH" | bc)
+        echo "$COUNTS" | awk -F ":" -v ratio="$RATIO" '{ 
+            if ($2>=ratio && ratio != 0) {
+                printf "%-9s : ", $1;
+                for (c=0; c<int($2/ratio); c++) printf "#"; 
+                printf "\n";
+            } else printf "%-9s :\n", $1;
+        }'
+    fi
+    return 0
+}
+
+# výpis grafu hodnot držených pozic podle tickeru
+graph_pos () {
+    POSITIONS=$(pos)
+    if [ $WIDTH -eq 0 ]; then
+        RATIO=1000
+    else
+        MAX=$(echo "$POSITIONS" | awk -F ":" 'function abs(v) {return v < 0 ? -v : v} { if (abs($2) > max        = 0) { max=abs($2) } } END { printf "%.2f", max }') 
+
+        float_scale=10
+        RATIO=$(echo "scale=$float_scale; $MAX/$WIDTH" | bc)
+    fi
+
+    echo "$POSITIONS" | awk -F ":" -v ratio="$RATIO" '{ 
+        if ($2>=ratio && ratio != 0) {
+            printf "%-9s : ", $1;
+            for(c=0;c<(int($2/ratio));c++) printf "#"; 
+            printf "\n";
+        } else if ($2<=-ratio && ratio != 0) {
+            printf "%-9s : ", $1;
+            for(c=0;c>(int($2/ratio));c--) printf "!"; printf "\n"
+        } else printf "%-9s :\n", $1; 
+    }'
+    return 0
+}
+
+AFTER="0000-00-00 00:00:00"
+BEFORE="9999-13-32 24:00:00"
+TICKERS=" "
+WIDTH=0
+COMMAND=""
+FILTER=0
+GZIP_LOGS=""
+LOGS=""
+
+# čtení vstupních argumentů
+while [ $# -gt 0 ] ; do
+    case $1 in
+        "-h"|"--help")
+            print_help
+            exit 0
+            ;;
+        # =========== příkazy ===========
+        "list-tick" | "profit" | "pos" | "last-price" | "hist-ord" | "graph-pos")
+            if [ -z $COMMAND ]; then
+                COMMAND="$1"
+            else
+                echo "tradelog: povolený je pouze jeden příkaz"
+                exit 1
+            fi
+            shift
+            ;;
+        # =========== filtry ============
+        "-a")
+            AFTER=$(echo "$2" | awk -F ";" -v AFTER="$AFTER" '{ if ($1 > AFTER) print $1}')
+            shift 2
+            ;;
+        "-b")
+            BEFORE=$(echo "$2" | awk -F ";" -v BEFORE="$BEFORE" '{ if ($1 > AFTER) print $1}')
+            shift 2
+            ;;
+        "-t")
+            TICKERS="$2|$TICKERS"
+            FILTER=1
+            shift 2
+            ;;
+        "-w")
+            # -w může být použito pouze jednou
+            if [ "$WIDTH" -ne 0 ]; then
+                echo "tradelog: -w je povoleno použít pouze jednou"
+                exit 1
+            fi
+            # width musí být > 0
+            WIDTH=$([ "$2" -eq "$2" ] 2>/dev/null && echo "$2" || echo "0")
+            if [ "$WIDTH" -eq 0 ]; then
+                echo "tradelog: WIDTH musí být kladné nenulové číslo"
+                exit 1
+            elif [ $2 -le 0 ]; then
+                echo "tradelog: WIDTH musí být kladné nenulové číslo"
+                exit 1
+            fi
+            shift 2
+            ;;
+        *)
+            if echo "$1" | grep -q ".gz$"; then
+                GZIP_LOGS="$GZIP_LOGS $1"
+            else
+                LOGS="$LOGS $1"
+            fi
+            shift
+            ;;
+    esac
+done 
+
+# příprava regulárního výrazu pro filtrování tickerů
+if [ $FILTER -eq 0 ]; then
+    TICKERS=".*"
+else
+    TICKERS="($TICKERS)"
+fi
+
+if test ! -t 0 && ([ -n "$GZIP_LOGS" ] || [ -n "$LOGS" ]); then
+    INPUT="$(cat | awk -F ";" -v ticks="^$TICKERS$" -v aft="$AFTER" -v bef="$BEFORE" '
+                $2 ~ ticks { if (NF == 7 && $1>aft && $1 <bef) {print} }' | awk -F, '{printf "%s\\n", $1}')$(read_input)"
+else
+    INPUT=$(read_input)
+fi
+
+# vykonání příkazu
+case $COMMAND in
+    "list-tick")
+        list_tick 
+        ;;
+    "profit")
+        profit
+        ;;
+    "pos")
+        VALUES=$(pos | sort -t: -k2 -n -r)
+        # hledání nejdelšího čísla podle počtu znaků kvůli zarovnání
+        MAX=$(echo "$VALUES" | awk -F ":" '{ if (length($2) > longest) { longest=length($2) } } END { print longest }')
+        echo "$VALUES" | awk -F ":" -v max="$MAX" '{ printf "%-9s : %*.2f\n", $1, max, $2 }'
+        ;;
+    "last-price")
+        last_price
+        ;;
+    "hist-ord")
+        hist_ord
+        ;;
+    "graph-pos")
+        graph_pos
+        ;;
+    *)
+        echo "$INPUT"
+        ;;
+esac
+
